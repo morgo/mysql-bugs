@@ -1,0 +1,128 @@
+name: read-after-write-violation
+
+# Matrix-reproduce the binlog_order_commits=ON visibility race across every
+# Linux runner GitHub hosts (the ubuntu-* family is the entire set --
+# GitHub-hosted runners are Ubuntu only) and the three current MySQL
+# release lines: 8.0, 8.4 (LTS), and 9.x (innovation).
+#
+# Exit-code convention: this is a *bug* reproducer, so the meaningful
+# signal is "where does the bug surface?" Each matrix cell flips the
+# repro.sh exit code:
+#
+#   repro.sh exit 1 (FAIL -- bug reproduced) -> workflow green
+#   repro.sh exit 0 (PASS -- no miss seen)    -> workflow red (notable)
+#   repro.sh exit 2 (infra)                   -> workflow red (broken)
+#
+# So a green matrix cell is "bug confirmed reproducible on this combo"
+# and a red cell is "bug did NOT reproduce, investigate".
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    # Once a week so we notice if a newer MySQL patch release fixes it.
+    - cron: '0 12 * * 1'
+
+jobs:
+  repro:
+    name: ${{ matrix.os }} × ${{ matrix.mysql }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        # The only Linux flavors GitHub hosts are Ubuntu LTS releases.
+        # ubuntu-latest is currently an alias for ubuntu-24.04 but we
+        # include it explicitly so the alias resolution itself is
+        # under test.
+        os:
+          - ubuntu-22.04
+          - ubuntu-24.04
+          - ubuntu-latest
+        mysql:
+          - mysql:8.0
+          - mysql:8.4
+          - mysql:9.7
+
+    services:
+      mysql:
+        image: ${{ matrix.mysql }}
+        env:
+          MYSQL_ROOT_PASSWORD: msandbox
+        ports:
+          - 3306:3306
+        # The mysql:* images enable log_bin / binlog_format=ROW /
+        # binlog_order_commits=ON by default, which is exactly the
+        # configuration the bug requires.
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -u root --password=msandbox"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install MySQL client tools
+        run: |
+          set -euxo pipefail
+          sudo apt-get update -qq
+          # Ubuntu's mysql-client metapackage pulls in Oracle MySQL 8.0
+          # client binaries (mysql, mysqlbinlog, mysqladmin) from main.
+          # We deliberately use this rather than the server's image so
+          # the client is the host distro's, not the same as the server
+          # under test.
+          sudo apt-get install -qq -y mysql-client
+          mysql --version
+          mysqlbinlog --version
+
+      - name: Probe server
+        env:
+          MYSQL_PWD: msandbox
+        run: |
+          set -euo pipefail
+          # Give the service container a few extra seconds beyond the
+          # healthcheck to settle (binlog file isn't necessarily ready
+          # the instant mysqladmin ping succeeds).
+          for i in $(seq 1 20); do
+            if mysql -h 127.0.0.1 -P 3306 -u root --protocol=tcp -e "SELECT 1" >/dev/null 2>&1; then
+              break
+            fi
+            sleep 1
+          done
+          mysql -h 127.0.0.1 -P 3306 -u root --protocol=tcp -e "
+            SELECT @@global.version             AS version,
+                   @@global.binlog_format       AS binlog_format,
+                   @@global.binlog_row_image    AS binlog_row_image,
+                   @@global.binlog_order_commits AS binlog_order_commits,
+                   @@global.sync_binlog         AS sync_binlog,
+                   @@global.log_bin             AS log_bin\G"
+
+      - name: Run reproducer
+        working-directory: read-after-write-violation
+        run: |
+          set +e
+          bash repro.sh \
+            -h 127.0.0.1 -P 3306 \
+            -u root -p msandbox \
+            -w 8 -t 240 -r 100
+          rc=$?
+          echo "::group::repro.sh exit code"
+          echo "exit=$rc"
+          echo "::endgroup::"
+          case "$rc" in
+            1)
+              echo "::notice ::Bug REPRODUCED on ${{ matrix.os }} × ${{ matrix.mysql }}"
+              exit 0
+              ;;
+            0)
+              echo "::warning ::Bug did NOT reproduce on ${{ matrix.os }} × ${{ matrix.mysql }} within 240s"
+              # Fail the cell so the matrix grid visibly flags it.
+              exit 1
+              ;;
+            *)
+              echo "::error ::Reproducer infrastructure failure on ${{ matrix.os }} × ${{ matrix.mysql }} (exit=$rc)"
+              exit "$rc"
+              ;;
+          esac
