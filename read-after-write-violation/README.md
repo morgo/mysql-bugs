@@ -60,11 +60,11 @@ The single-statement variants — autocommit `INSERT`, or `BEGIN; INSERT;
 COMMIT;` — do not surface the race in the same time budget. The
 INSERT+UPDATE-in-the-same-transaction shape is the minimum trigger.
 
-The race has been observed on MySQL 8.0, 8.4, and 9.x, on Linux. It has not
-been reproduced on macOS-native MySQL in short runs, but the same Docker
-images that reproduce it on Linux CI runners reproduce it on Linux
-elsewhere, so the most parsimonious read is that the window is simply
-narrower on Darwin's scheduler.
+The race has been observed on MySQL 8.0, 8.4, and 9.x, on both Linux (CI
+runners, Docker on Linux hosts) and macOS (Docker Desktop and native
+MySQL). It is not specific to any one host kernel or distribution; the
+matrix workflow in this repo is for evidence-gathering across MySQL
+versions, not to claim the bug is Linux-only.
 
 ## Why this breaks tools like spirit
 
